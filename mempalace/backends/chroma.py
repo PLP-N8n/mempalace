@@ -708,7 +708,12 @@ def _missing_dimensionality_appears_recoverable(
         return False
 
     label_count = len(id_to_label)
-    if int(total) != label_count or len(label_to_id) != label_count:
+    # total_elements_added is monotonic across every add, while id_to_label and
+    # label_to_id hold only live elements, so a segment that has had deletions
+    # carries total_elements_added > label_count. Require >= (not ==), otherwise
+    # every post-deletion dim-None segment is wrongly quarantined (#1710); the
+    # label-map size and bijection checks still reject inconsistent label maps.
+    if int(total) < label_count or len(label_to_id) != label_count:
         return False
     try:
         return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())

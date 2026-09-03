@@ -21,6 +21,7 @@ from mempalace.backends import (
 from mempalace.backends.chroma import (
     ChromaBackend,
     ChromaCollection,
+    _HNSW_BLOAT_GUARD,
     _HNSW_MISSING_METADATA_DATA_FLOOR,
     _fix_blob_seq_ids,
     _pin_hnsw_threads,
@@ -1005,6 +1006,50 @@ def test_pin_hnsw_threads_retrofits_legacy_collection(tmp_path):
     _pin_hnsw_threads(col)
 
     assert col.configuration_json["hnsw"]["num_threads"] == 1
+
+
+def test_pin_hnsw_threads_retrofits_bloat_guard_thresholds(tmp_path):
+    """A legacy collection at chromadb's default thresholds gets the guard's
+    ``batch_size`` / ``sync_threshold`` re-applied in memory (#1579 retrofit)."""
+    palace_path = tmp_path / "legacy-palace"
+    palace_path.mkdir()
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.create_collection(
+        "mempalace_drawers",
+        metadata={"hnsw:space": "cosine"},  # no thresholds — legacy defaults
+    )
+    hnsw_before = col.configuration_json.get("hnsw", {})
+    assert hnsw_before.get("sync_threshold") in (None, 1000)
+    assert hnsw_before.get("batch_size") in (None, 100)
+
+    _pin_hnsw_threads(col)
+
+    hnsw = col.configuration_json["hnsw"]
+    assert hnsw["batch_size"] == _HNSW_BLOAT_GUARD["hnsw:batch_size"]
+    assert hnsw["sync_threshold"] == _HNSW_BLOAT_GUARD["hnsw:sync_threshold"]
+
+
+def test_pin_hnsw_threads_sync_threshold_survives_reopen(tmp_path):
+    """What the retrofit can and cannot promise on chromadb 1.5.x, pinned so
+    nobody re-derives it: ``modify(configuration=...)`` persists
+    ``sync_threshold`` across a reopen but NOT ``batch_size`` (measured
+    2026-09-03; ``modify(metadata=...)`` refuses ``hnsw:*`` keys outright). So
+    a legacy collection's on-disk lag shrinks from up to 999 rows to up to 99,
+    and a collection under 100 rows still needs a rebuild to persist at all."""
+    palace_path = tmp_path / "legacy-palace"
+    palace_path.mkdir()
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    _pin_hnsw_threads(col)
+    del col, client
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    hnsw = col.configuration_json.get("hnsw", {})
+    assert hnsw.get("sync_threshold") == _HNSW_BLOAT_GUARD["hnsw:sync_threshold"], (
+        "sync_threshold must survive a reopen — it is the half of the retrofit that persists"
+    )
 
 
 def test_pin_hnsw_threads_swallows_all_errors():

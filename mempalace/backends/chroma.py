@@ -640,17 +640,27 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
 
 
 def _pin_hnsw_threads(collection) -> None:
-    """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
+    """Best-effort retrofit: pin ``hnsw:num_threads=1`` and the bloat-guard
+    thresholds on an existing collection.
 
-    Fresh collections set this via ``metadata=`` at creation. Legacy palaces
-    built before that change keep the default (parallel insert) and can hit
-    the HNSW race described in #974/#965. ChromaDB's
-    ``collection.modify(configuration=...)`` lets us re-apply ``num_threads=1``
+    Fresh collections set these via ``metadata=`` at creation. Legacy palaces
+    built before that change keep the defaults: parallel insert (the HNSW
+    race described in #974/#965) and ``batch_size=100`` /
+    ``sync_threshold=1000``. At those defaults a collection persists its
+    vector index only every 1,000 adds, so a small collection NEVER writes
+    ``index_metadata.pickle`` (the shape ``quarantine_stale_hnsw`` renames to
+    ``.drift-*`` on a cold open, #1579) and a large one runs up to 999 rows
+    behind sqlite on disk. Measured on a 3,259-row palace: the persisted index
+    held 2,959; after this retrofit and one reopen, with no writes at all, it
+    held every row — chromadb replays the pending ``embeddings_queue`` entries
+    at open and, with the thresholds at 2, persists them immediately.
+
+    ChromaDB's ``collection.modify(configuration=...)`` re-applies all three
     in memory at load time so every new process is protected.
 
     Note: in chromadb 1.5.x the modified ``configuration_json["hnsw"]`` does
-    not persist to disk across ``PersistentClient`` reopens, so this must
-    run on every ``get_collection`` call, not just once.
+    not reliably persist to disk across ``PersistentClient`` reopens, so this
+    must run on every ``get_collection`` call, not just once.
     """
     try:
         from chromadb.api.collection_configuration import (
@@ -662,7 +672,13 @@ def _pin_hnsw_threads(collection) -> None:
         return
     try:
         collection.modify(
-            configuration=UpdateCollectionConfiguration(hnsw=UpdateHNSWConfiguration(num_threads=1))
+            configuration=UpdateCollectionConfiguration(
+                hnsw=UpdateHNSWConfiguration(
+                    num_threads=1,
+                    batch_size=_HNSW_BLOAT_GUARD["hnsw:batch_size"],
+                    sync_threshold=_HNSW_BLOAT_GUARD["hnsw:sync_threshold"],
+                )
+            )
         )
     except Exception:
         logger.debug("_pin_hnsw_threads modify failed", exc_info=True)

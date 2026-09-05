@@ -65,6 +65,7 @@ from .version import __version__  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 
 from .backends.chroma import (  # noqa: E402
+    evict_shared_system,
     ChromaBackend,
     ChromaCollection,
     _HNSW_BLOAT_GUARD,
@@ -440,6 +441,12 @@ def _get_client():
     inode check alone misses in-place modifications that invalidate the
     in-memory HNSW index.
 
+    When the DB changes, the previously cached client is closed, the shared
+    backend palace handle is released, and chromadb's process-wide System for
+    this palace is evicted before a fresh ``PersistentClient`` is opened. This
+    prevents the new client from reusing a stale HNSW segment that another
+    process updated on disk.
+
     Note: FAT/exFAT may return 0 for st_ino — the ``current_inode != 0``
     guard skips reconnect detection on those filesystems (safe fallback).
     """
@@ -460,10 +467,31 @@ def _get_client():
         current_mtime = 0.0
 
     # If the DB file disappeared (e.g. during rebuild) but we have a cached
-    # collection, invalidate so we don't serve stale data.  Without this,
-    # both stored and current values are 0 on the first call after deletion,
-    # making inode_changed and mtime_changed both False.
+    # collection, close the old client and evict the shared system so we don't
+    # serve stale data. Without this, both stored and current values are 0 on
+    # the first call after deletion, making inode_changed and mtime_changed
+    # both False.
     if not os.path.isfile(db_path) and _collection_cache is not None:
+        if _client_cache is not None:
+            try:
+                _client_cache.close()
+            except Exception:
+                logger.debug("Failed to close cached Chroma client", exc_info=True)
+            try:
+                from . import palace as palace_module
+
+                palace_module._DEFAULT_BACKEND.close_palace(_config.palace_path)
+            except Exception:
+                logger.debug(
+                    "Failed to close shared palace backend during missing-DB reconnect",
+                    exc_info=True,
+                )
+            try:
+                evict_shared_system(_config.palace_path)
+            except Exception:
+                logger.debug(
+                    "evict_shared_system failed during missing-DB reconnect", exc_info=True
+                )
         _client_cache = None
         _collection_cache = None
         _palace_db_inode = 0
@@ -478,6 +506,24 @@ def _get_client():
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
         # metadata-pickle read; never touches the HNSW binary files.
+        if _client_cache is not None:
+            try:
+                _client_cache.close()
+            except Exception:
+                logger.debug("Failed to close cached Chroma client", exc_info=True)
+            try:
+                from . import palace as palace_module
+
+                palace_module._DEFAULT_BACKEND.close_palace(_config.palace_path)
+            except Exception:
+                logger.debug(
+                    "Failed to close shared palace backend during reconnect",
+                    exc_info=True,
+                )
+            try:
+                evict_shared_system(_config.palace_path)
+            except Exception:
+                logger.debug("evict_shared_system failed during reconnect", exc_info=True)
         _refresh_vector_disabled_flag()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None

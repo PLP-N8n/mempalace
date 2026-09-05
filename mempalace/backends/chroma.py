@@ -936,6 +936,66 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
+def evict_shared_system(palace_path: str) -> None:
+    """Evict chromadb's process-wide cached ``System`` for ``palace_path``.
+
+    chromadb 1.5.x keeps one ``System`` per identifier in
+    ``SharedSystemClient._identifier_to_system``. For a ``PersistentClient``
+    the identifier is the ``persist_directory`` setting. When another process
+    changes ``chroma.sqlite3`` the cached System still holds a stale in-memory
+    HNSW segment; dropping it (and stopping it) forces chromadb to load the
+    on-disk segment and replay the WAL when a new ``PersistentClient`` opens.
+
+    Falls back to ``SharedSystemClient.clear_system_cache()`` if the private
+    attribute is unavailable. This function never raises into callers.
+    """
+    try:
+        from chromadb.api.client import SharedSystemClient
+        from chromadb.config import Settings
+    except Exception:
+        logger.debug("Cannot import chromadb SharedSystemClient", exc_info=True)
+        return
+
+    systems = getattr(SharedSystemClient, "_identifier_to_system", None)
+    if not isinstance(systems, dict):
+        try:
+            clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
+            if callable(clear_system_cache):
+                clear_system_cache()
+        except Exception:
+            logger.debug("clear_system_cache() fallback failed", exc_info=True)
+        return
+
+    # PersistentClient uses the persist_directory as its shared identifier.
+    identifier = palace_path
+    get_identifier = getattr(SharedSystemClient, "_get_identifier_from_settings", None)
+    if get_identifier is not None:
+        try:
+            settings = Settings(persist_directory=palace_path, is_persistent=True)
+            # The default API implementation for PersistentClient is either the
+            # Rust bindings or SegmentAPI; both resolve persistent identifiers
+            # from persist_directory, so either choice is sufficient here.
+            if settings.chroma_api_impl is None:
+                settings.chroma_api_impl = "chromadb.api.segment.SegmentAPI"
+            identifier = get_identifier(settings)
+        except Exception:
+            logger.debug(
+                "SharedSystemClient._get_identifier_from_settings failed; "
+                "falling back to raw palace_path",
+                exc_info=True,
+            )
+            identifier = palace_path
+
+    system = systems.pop(identifier, None)
+    if system is not None:
+        try:
+            stop = getattr(system, "stop", None)
+            if callable(stop):
+                stop()
+        except Exception:
+            logger.debug("stop() failed on evicted chromadb System", exc_info=True)
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -1282,6 +1342,11 @@ class ChromaBackend(BaseBackend):
           when either side is 0 (safe fallback) but still honor mtime.
         * Mtime change uses an epsilon (0.01 s) to tolerate FS timestamp
           granularity without thrashing.
+
+        Before replacing a cached client we close it and evict chromadb's
+        shared ``System`` for this palace path. This ensures the new
+        ``PersistentClient`` loads the on-disk HNSW segment and WAL rather than
+        reusing a stale in-memory index from another process.
         """
         if self._closed:
             from .base import BackendClosedError  # late import avoids cycles at module load
@@ -1297,6 +1362,10 @@ class ChromaBackend(BaseBackend):
         if cached is not None and not os.path.isfile(db_path):
             _close_client(self._clients.pop(palace_path, None))
             self._freshness.pop(palace_path, None)
+            try:
+                evict_shared_system(palace_path)
+            except Exception:
+                logger.debug("evict_shared_system failed for missing DB", exc_info=True)
             cached = None
             cached_inode, cached_mtime = 0, 0.0
 
@@ -1318,6 +1387,17 @@ class ChromaBackend(BaseBackend):
             # already cleaned this path" credit from the prior inode.
             if inode_changed:
                 ChromaBackend._quarantined_paths.discard(palace_path)
+
+            # We are about to replace an existing cached client. Close it and
+            # evict chromadb's shared System first so the new client cannot
+            # inherit a stale in-memory HNSW segment.
+            if cached is not None:
+                _close_client(self._clients.pop(palace_path, None))
+                try:
+                    evict_shared_system(palace_path)
+                except Exception:
+                    logger.debug("evict_shared_system failed during rebuild", exc_info=True)
+
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
